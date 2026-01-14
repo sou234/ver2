@@ -34,126 +34,107 @@ def to_excel(df_new, df_inc, df_dec, df_all, date):
 # 1. 페이지 설정
 # ---------------------------------------------------------
 st.set_page_config(
-    page_title="MAS Decision Support System V3.0",
+    page_title="MAS Market Narrative V5.0",
     page_icon="🍊",
     layout="wide"
 )
 
 # ---------------------------------------------------------
-# 2. 데이터 수집 함수
+# 2. 데이터 수집 로직 (테마/내러티브 중심)
 # ---------------------------------------------------------
 
+# 주요 테마와 대표 자산(Proxy) 매핑
+MARKET_THEMES = {
+    "🤖 AI & 반도체 혁명": {"ticker": "NVDA", "name": "Nvidia", "query": "Nvidia AI semiconductor stock"},
+    "⚡ 전기차/2차전지 캐즘?": {"ticker": "TSLA", "name": "Tesla", "query": "Tesla EV battery stock"},
+    "🏛️ 미 연준(Fed) & 금리": {"ticker": "^TNX", "name": "미국채 10년물", "query": "Federal Reserve interest rate bond yield"},
+    "🇨🇳 중국/이머징 마켓": {"ticker": "FXI", "name": "China Large-Cap", "query": "China economy stimulus stock market"},
+    "🪙 크립토/디지털자산": {"ticker": "BTC-USD", "name": "Bitcoin", "query": "Bitcoin crypto regulation price"},
+    "🛢️ 에너지/지정학 리스크": {"ticker": "CL=F", "name": "WTI 유가", "query": "Oil price Middle East war energy"},
+    "💊 비만치료제/바이오": {"ticker": "LLY", "name": "Eli Lilly", "query": "Eli Lilly weight loss drug stock"},
+    "🇰🇷 한국 증시 (대표)": {"ticker": "^KS11", "name": "KOSPI", "query": "KOSPI Korea stock market"}
+}
+
 @st.cache_data(ttl=600)
-def fetch_market_data():
-    """시장/거시 지표 수집 (yfinance + curl_cffi)"""
-    tickers = {
-        "KOSPI": "^KS11", 
-        "S&P500": "^GSPC", 
-        "USD/KRW": "KRW=X",
-        "Bitcoin": "BTC-USD",
-        "VIX (공포)": "^VIX",
-        "US 10Y (금리)": "^TNX",
-        "WTI Rough (유가)": "CL=F",
-        "Gold (금)": "GC=F"
-    }
-    market_data, history_data = {}, {}
+def fetch_narrative_data():
+    """테마별 대표 자산의 등락률을 계산하여 '오늘의 핫 토픽' 선정"""
+    narratives = []
     
-    # 세션 생성 (봇 탐지 우회)
     session = curequests.Session(impersonate="chrome")
     session.verify = False
 
-    for name, ticker in tickers.items():
+    for theme, info in MARKET_THEMES.items():
         try:
-            # yfinance로 데이터 수집
+            ticker = info['ticker']
             stock = yf.Ticker(ticker, session=session)
-            # 최근 1년치
-            df = stock.history(period="1y")
+            # 최근 5일치 가져와서 전일비 비교 (휴장일 고려 안전하게)
+            hist = stock.history(period="5d")
             
-            if not df.empty:
-                current = df['Close'].iloc[-1]
-                # 전일 데이터가 있으면 변동 계산
-                if len(df) >= 2:
-                    prev = df['Close'].iloc[-2]
-                    pct = ((current - prev) / prev * 100)
-                    change = current - prev
-                else:
-                    change = 0
-                    pct = 0
+            if len(hist) >= 2:
+                current = hist['Close'].iloc[-1]
+                prev = hist['Close'].iloc[-2]
+                change = current - prev
+                pct = (change / prev) * 100
                 
-                # 20일 이평선 트렌드
-                df['MA20'] = df['Close'].rolling(window=20).mean()
-                ma20 = df['MA20'].iloc[-1] if not pd.isna(df['MA20'].iloc[-1]) else current
-                trend = "상승 🐂" if current > ma20 else "하락 🐻"
-                
-                market_data[name] = {
-                    "price": current, 
-                    "change": change, 
-                    "pct_change": pct, 
-                    "trend": trend
-                }
-                history_data[name] = df
-        except Exception as e:
-            # print(f"Error fetching {name}: {e}")
-            pass
+                narratives.append({
+                    "theme": theme,
+                    "proxy": info['name'],
+                    "ticker": ticker,
+                    "price": current,
+                    "pct_change": pct,
+                    "query": info['query'],
+                    "history": hist['Close'] # 차트용
+                })
+        except Exception:
+            continue
             
-    return market_data, history_data
+    # 등락률 절댓값 기준 정렬 (시장을 가장 크게 움직인 테마 순)
+    narratives.sort(key=lambda x: abs(x['pct_change']), reverse=True)
+    return narratives
 
 @st.cache_data(ttl=1800)
-def fetch_industry_news(topic):
-    """구글 뉴스 RSS를 통해 특정 토픽의 뉴스 수집"""
-    # 주제별 검색 쿼리 매핑
-    queries = {
-        "AI & 반도체": "Nvidia OR OpenAI OR TSMC OR Samsung Electronics semiconductor",
-        "2차전지 & EV": "Tesla OR CATL OR LG Energy Solution OR electric vehicle battery",
-        "바이오 & 헬스케어": "Eli Lilly OR Novo Nordisk OR biotech OR FDA approval",
-        "글로벌 거시경제": "Federal Reserve OR inflation OR interest rate OR US economy"
-    }
-    
-    query = queries.get(topic, "Global Economy")
-    encoded_query = requests.utils.quote(query)
-    # 구글 뉴스 RSS URL (언어: 영어/한국어 섞여있을 수 있음, 여기선 US edition 사용)
-    rss_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=en-US&gl=US&ceid=US:en"
-    
+def fetch_news_headline(query, lang='en'):
+    """구글 뉴스 RSS에서 뉴스 수집 (언어 선택 가능)"""
+    encoded = requests.utils.quote(query)
+    if lang == 'en':
+        url = f"https://news.google.com/rss/search?q={encoded}&hl=en-US&gl=US&ceid=US:en"
+    else:
+        url = f"https://news.google.com/rss/search?q={encoded}&hl=ko&gl=KR&ceid=KR:ko"
+        
     try:
-        feed = feedparser.parse(rss_url)
-        news_items = []
-        for entry in feed.entries[:10]: # 최신 10개만
-            news_items.append({
-                "title": entry.title,
-                "link": entry.link,
-                "published": entry.published,
-                "source": entry.source.title if hasattr(entry, 'source') else "Google News"
-            })
-        return news_items
-    except Exception as e:
+        feed = feedparser.parse(url)
+        items = []
+        for e in feed.entries[:2]:
+            items.append({"title": e.title, "link": e.link, "source": e.source.title if hasattr(e, 'source') else "News", "lang": lang})
+        return items
+    except:
         return []
 
-def analyze_news_keywords(news_items):
-    """뉴스 제목에서 키워드 추출 및 빈도 분석"""
-    text = " ".join([item['title'] for item in news_items])
-    # 영문, 숫자만 남기고 제거
-    text = re.sub(r'[^a-zA-Z\s]', '', text)
-    words = text.lower().split()
-    
-    # 불용어 처리 (간단한 리스트)
-    stop_words = {'to', 'in', 'for', 'of', 'and', 'the', 'a', 'on', 'at', 'with', 'by', 'as', 'is', 'new', 'stocks', 'market'}
-    keywords = [w for w in words if w not in stop_words and len(w) > 2]
-    
-    return Counter(keywords).most_common(10)
+# 테마별 한국어 쿼리 매핑
+THEME_KR_QUERIES = {
+    "🤖 AI & 반도체 혁명": "엔비디아 반도체 AI 주가",
+    "⚡ 전기차/2차전지 캐즘?": "테슬라 전기차 배터리 주가",
+    "🏛️ 미 연준(Fed) & 금리": "미국 연준 금리 채권",
+    "🇨🇳 중국/이머징 마켓": "중국 경기부양책 증시",
+    "🪙 크립토/디지털자산": "비트코인 가상화폐 시세 규제",
+    "🛢️ 에너지/지정학 리스크": "국제유가 중동 전쟁 에너지",
+    "💊 비만치료제/바이오": "일라이릴리 비만치료제 바이오주",
+    "🇰🇷 한국 증시 (대표)": "코스피 한국 증시 전망"
+}
 
-# 데이터 로드
-metrics, histories = fetch_market_data()
+# 데이터 로딩
+hot_narratives = fetch_narrative_data()
 
 # ---------------------------------------------------------
 # 3. 사이드바 구성
 # ---------------------------------------------------------
 with st.sidebar:
     st.title("🍊 Mirae Asset")
-    st.subheader("고객자산배분본부")
-    st.caption("Ver 3.0 - Correlation & Comparison")
+    st.subheader("Daily Market Briefing")
+    st.caption("Ver 5.1 - Narrative & Impact")
     st.markdown("---")
     
-    menu = st.radio("메뉴 선택", ["📌 시장 동향", "🔍 기업 펀더멘털 스카우터", "📰 글로벌 산업 뉴스", "📊 타임폴리오 ETF 분석"])
+    menu = st.radio("메뉴 선택", ["📰 데일리 마켓 내러티브", "🔍 기업 펀더멘털 스카우터", "📊 타임폴리오 ETF 분석"])
     
     if st.button("🔄 데이터 새로고침"):
         st.cache_data.clear()
@@ -162,93 +143,126 @@ with st.sidebar:
 # 4. 메인 화면
 # ---------------------------------------------------------
 
-if menu == "📌 시장 동향":
-    st.title("📈 Global Market Monitor")
+if menu == "📰 데일리 마켓 내러티브":
     
-    # 8개 지표를 4열 2행으로 배치
-    row1_cols = st.columns(4)
-    row2_cols = st.columns(4)
+    st.title("📰 Daily Market Narrative")
+    st.markdown("""
+    단순한 지수 나열이 아닙니다.  
+    **"어제 무슨 이슈(Topic)가 있었고 ➡️ 그 결과 어떤 자산이 움직였는지(Impact)"** 인과관계를 중심으로 정리합니다.
+    """)
+    st.markdown("---")
     
-    indicators_row1 = ["KOSPI", "S&P500", "USD/KRW", "Bitcoin"]
-    indicators_row2 = ["VIX (공포)", "US 10Y (금리)", "WTI Rough (유가)", "Gold (금)"]
+    # [1] 오늘의 Top 3 이슈 카드 (상단 강조)
+    st.subheader("🔥 Today's Hot Issues (Top 3 Movers)")
     
-    def display_metric(col, key):
-        if key in metrics:
-            d = metrics[key]
-            current_val = d['price']
+    top_movers = hot_narratives[:3] if hot_narratives else []
+    
+    cols = st.columns(3)
+    for i, item in enumerate(top_movers):
+        with cols[i]:
+            # 스타일링: 상승(빨강) / 하락(파랑)
+            color = "red" if item['pct_change'] > 0 else "blue"
+            direction = "▲ 급등" if item['pct_change'] > 0 else "▼ 급락"
+            bg_color = "rgba(255, 0, 0, 0.1)" if item['pct_change'] > 0 else "rgba(0, 0, 255, 0.1)"
             
-            # 포맷팅 설정 (지수/상품마다 다름)
-            if "KRW" in key:
-                fmt = "{:,.2f}원"
-            elif "VIX" in key or "10Y" in key:
-                fmt = "{:,.2f}"
-            else:
-                fmt = "{:,.2f}"
-            
-            col.metric(
-                label=key,
-                value=fmt.format(current_val),
-                delta=f"{d['change']:+.2f} ({d['pct_change']:+.2f}%) / {d['trend']}",
-                delta_color="inverse" if "KRW" in key or "VIX" in key or "10Y" in key else "normal"
+            # 카드 형태 디자인
+            st.info(f"**{item['theme']}**")
+            st.metric(
+                label=item['proxy'],
+                value=f"{item['price']:,.2f}",
+                delta=f"{item['pct_change']:+.2f}%",
+                delta_color="normal"
             )
             
-            # 미니 차트 (확장기능)
-            if key in histories and not histories[key].empty:
-                col.line_chart(histories[key]['Close'], height=100)
+            # 미니 차트
+            st.line_chart(item['history'], height=80)
+            
+            # 뉴스 매핑 (왜 올랐나/내렸나?) - EN & KR
+            st.caption("📌 Global & Local Headlines")
+            
+            # English News
+            news_en = fetch_news_headline(item['query'], lang='en')
+            if news_en:
+                st.markdown(f"**🇺🇸 Global**: [{news_en[0]['title']}]({news_en[0]['link']})")
+                
+            # Korean News
+            kr_query = THEME_KR_QUERIES.get(item['theme'], item['theme'])
+            news_kr = fetch_news_headline(kr_query, lang='ko')
+            if news_kr:
+                st.markdown(f"**🇰🇷 Korea**: [{news_kr[0]['title']}]({news_kr[0]['link']})")
 
-    # 1열 출력
-    for col, key in zip(row1_cols, indicators_row1):
-        display_metric(col, key)
-        
     st.markdown("---")
-        
-    # 2열 출력
-    for col, key in zip(row2_cols, indicators_row2):
-        display_metric(col, key)
 
-    # [새 기능] 자산 상관관계 히트맵
-    st.subheader("📊 자산 상관관계 히트맵 (1 Year)")
-    st.markdown("주요 자산 간의 **가격 상관계수**를 분석하여 분산 투자 효과를 점검합니다.")
+    # [2] 전체 테마별 상세 브리핑 (리스트 뷰)
+    st.subheader("📋 Sector & Theme Impact Report (EN vs KR)")
     
-    if histories:
-        # 데이터 병합
-        combined_df = pd.DataFrame()
-        
-        for key, df in histories.items():
-            if not df.empty:
-                # 1. Series 추출
-                series = df['Close'].copy()
-                
-                # 2. 인덱스 Timezone 제거 및 날짜로 변환 (서로 다른 타임존/시간대 정렬 문제 해결)
-                # DatetimeIndex인지 확인 후 처리
-                if isinstance(series.index, pd.DatetimeIndex):
-                    series.index = series.index.normalize().tz_localize(None)
-                
-                # 3. 데이터프레임에 추가 (자동으로 날짜 기준 Join됨)
-                combined_df[key] = series
-        
-        # 결측치 제거 (모든 자산이 거래된 날만 포함 -> 휴장일/주말 제외 효과)
-        # 우선 원본 유지하면서 dropna
-        corr_df = combined_df.dropna()
-        
-        if not corr_df.empty and len(corr_df) > 10: # 최소 10일치 이상 데이터 필요
-            corr_matrix = corr_df.corr()
-            
-            fig_corr = px.imshow(corr_matrix, 
-                                text_auto='.2f', 
-                                aspect="auto",
-                                color_continuous_scale="RdBu_r", # +1(상관높음)=Red, -1(역상관)=Blue
-                                origin='lower')
-            st.plotly_chart(fig_corr, use_container_width=True)
-            
-            st.caption(f"* 분석 기간: {corr_df.index.min().date()} ~ {corr_df.index.max().date()} ({len(corr_df)} 영업일 기준)")
-        else:
-            st.warning("상관관계를 계산할 공통 데이터가 충분하지 않습니다. (서로 다른 휴장일/데이터 부족 등)")
+    # 탭으로 상승/하락 이슈 구분
+    tab_rise, tab_fall = st.tabs(["🚀 상승 모멘텀 (Bullish)", "💧 하락 리스크 (Bearish)"])
+    
+    with tab_rise:
+        risers = [n for n in hot_narratives if n['pct_change'] > 0]
+        if risers:
+            for item in risers:
+                with st.expander(f"**{item['theme']}**: {item['proxy']} (+{item['pct_change']:.2f}%)", expanded=True):
+                    c1, c2, c3 = st.columns([1.2, 1.2, 0.6])
+                    
+                    # English News
+                    with c1:
+                        st.markdown(f"#### 🇺🇸 Global Perspective")
+                        news_en = fetch_news_headline(item['query'], lang='en')
+                        for n in news_en:
+                            st.success(f"**{n['source']}**: [{n['title']}]({n['link']})")
 
+                    # Korean News
+                    with c2:
+                        st.markdown(f"#### 🇰🇷 Domestic View")
+                        kr_query = THEME_KR_QUERIES.get(item['theme'], item['theme'])
+                        news_kr = fetch_news_headline(kr_query, lang='ko')
+                        for n in news_kr:
+                            st.success(f"**{n['source']}**: [{n['title']}]({n['link']})")
+
+                    with c3:
+                        st.markdown(f"#### 📈 Price Action")
+                        st.line_chart(item['history'])
+        else:
+            st.write("오늘 눈에 띄게 상승한 주요 테마가 없습니다.")
+
+    with tab_fall:
+        fallers = [n for n in hot_narratives if n['pct_change'] <= 0]
+        if fallers:
+            for item in fallers:
+                with st.expander(f"**{item['theme']}**: {item['proxy']} ({item['pct_change']:.2f}%)", expanded=True):
+                    c1, c2, c3 = st.columns([1.2, 1.2, 0.6])
+                    
+                    # English News
+                    with c1:
+                        st.markdown(f"#### 🇺🇸 Global Perspective")
+                        news_en = fetch_news_headline(item['query'], lang='en')
+                        for n in news_en:
+                            st.error(f"**{n['source']}**: [{n['title']}]({n['link']})")
+                            
+                    # Korean News
+                    with c2:
+                        st.markdown(f"#### 🇰🇷 Domestic View")
+                        kr_query = THEME_KR_QUERIES.get(item['theme'], item['theme'])
+                        news_kr = fetch_news_headline(kr_query, lang='ko')
+                        for n in news_kr:
+                            st.error(f"**{n['source']}**: [{n['title']}]({n['link']})")
+                            
+                    with c3:
+                        st.markdown(f"#### 📉 Price Action")
+                        st.line_chart(item['history'])
+        else:
+            st.write("오늘 눈에 띄게 하락한 주요 테마가 없습니다.")
+
+    st.markdown("---")
+    st.caption("*데이터: Yahoo Finance, Google News RSS")
+
+# ---------------------------------------------------------
+# [기존 기능 유지] 스카우터 & ETF
+# ---------------------------------------------------------
 elif menu == "🔍 기업 펀더멘털 스카우터":
     st.title("🔍 Stock Fundamental Scout")
-    st.markdown("관심 종목의 **핵심 펀더멘털 지표**와 **컨센서스**를 한눈에 파악하세요.")
-    
     col1, col2 = st.columns([1, 3])
     with col1:
         ticker_input = st.text_input("티커 입력 (예: NVDA, AAPL, 005930.KS)", "NVDA").strip().upper()
@@ -258,106 +272,63 @@ elif menu == "🔍 기업 펀더멘털 스카우터":
         if st.button("스카우팅 시작"):
             st.session_state['scout_trigger'] = True
 
-        if ticker_input:
-            try:
-                session = curequests.Session(impersonate="chrome")
-                session.verify = False
-                stock = yf.Ticker(ticker_input, session=session)
-                info = stock.info
-                
-                # 1. 헤더 정보
-                st.subheader(f"{info.get('longName', ticker_input)} ({ticker_input})")
-                
-                # 가격 정보
-                current_price = info.get('currentPrice', info.get('previousClose', 0))
-                target_price = info.get('targetMeanPrice', 0)
-                
-                # 2. 핵심 지표 카드
-                m1, m2, m3, m4 = st.columns(4)
-                m1.metric("현재 주가", f"${current_price:,.2f}" if current_price else "N/A")
-                m2.metric("시가총액", f"${info.get('marketCap', 0)/1e9:,.1f} B" if info.get('marketCap') else "N/A")
-                m3.metric("52주 최고가", f"${info.get('fiftyTwoWeekHigh', 0):,.2f}")
-                m4.metric("목표주가 (Mean)", f"${target_price:,.2f}" if target_price else "N/A", 
-                          delta=f"{(target_price/current_price - 1)*100:.1f}% Upside" if target_price and current_price else None)
-
-                st.markdown("---")
-                
-                # 3. 상세 펀더멘털 탭
-                t1, t2 = st.tabs(["📊 밸류에이션 & 수익성", "📈 주가 차트"])
-                
-                with t1:
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        st.markdown("##### 💎 밸류에이션")
-                        df_val = pd.DataFrame([
-                            {"지표": "Trailing P/E", "값": info.get('trailingPE', 'N/A')},
-                            {"지표": "Forward P/E", "값": info.get('forwardPE', 'N/A')},
-                            {"지표": "PEG Ratio", "값": info.get('pegRatio', 'N/A')},
-                            {"지표": "Price/Book (PBR)", "값": info.get('priceToBook', 'N/A')},
-                            {"지표": "Price/Sales (PSR)", "값": info.get('priceToSalesTrailing12Months', 'N/A')},
-                        ])
-                        st.dataframe(df_val, hide_index=True, use_container_width=True)
-                        
-                    with c2:
-                        st.markdown("##### 💰 수익성 & 배당")
-                        df_prf = pd.DataFrame([
-                            {"지표": "ROE", "값": f"{info.get('returnOnEquity', 0)*100:.2f}%" if info.get('returnOnEquity') else 'N/A'},
-                            {"지표": "Profit Margin", "값": f"{info.get('profitMargins', 0)*100:.2f}%" if info.get('profitMargins') else 'N/A'},
-                            {"지표": "Dividend Yield", "값": f"{info.get('dividendRate', 0)*100:.2f}%" if info.get('dividendRate') else 'N/A'},
-                            {"지표": "Beta", "값": info.get('beta', 'N/A')},
-                        ])
-                        st.dataframe(df_prf, hide_index=True, use_container_width=True)
-                    
-                    st.info(f"💡 {info.get('longBusinessSummary', '기업 설명 정보가 없습니다.')[:300]}...")
-
-                with t2:
-                    st.markdown("##### 최근 1년 주가 흐름")
-                    hist = stock.history(period="1y")
-                    if not hist.empty:
-                        st.line_chart(hist['Close'])
-                    else:
-                        st.warning("주가 데이터를 불러올 수 없습니다.")
-                        
-            except Exception as e:
-                st.error(f"데이터를 가져오는 중 오류가 발생했습니다: {e}") 
-
-
-elif menu == "📰 글로벌 산업 뉴스":
-    st.title("📰 Global Industry & Macro News")
-    st.markdown("주요 산업 및 거시 경제 관련 최신 뉴스를 실시간으로 확인하세요.")
-    
-    # 탭으로 분야 구분
-    topics = ["AI & 반도체", "2차전지 & EV", "바이오 & 헬스케어", "글로벌 거시경제"]
-    tabs = st.tabs(topics)
-    
-    for i, topic in enumerate(topics):
-        with tabs[i]:
-            st.subheader(f"{topic} 주요 뉴스")
-            news_items = fetch_industry_news(topic)
+    if ticker_input:
+        try:
+            session = curequests.Session(impersonate="chrome")
+            session.verify = False
+            stock = yf.Ticker(ticker_input, session=session)
+            info = stock.info
             
-            if news_items:
-                # [새 기능] 키워드 트렌드 분석
-                st.markdown("##### ☁️ 뉴스 키워드 트렌드")
-                keywords_data = analyze_news_keywords(news_items)
-                
-                if keywords_data:
-                    kw_df = pd.DataFrame(keywords_data, columns=['키워드', '빈도'])
-                    fig_kw = px.bar(kw_df, x='키워드', y='빈도', color='빈도', 
-                                   title=f"'{topic}' 관련 뉴스 최다 빈출 단어",
-                                   color_continuous_scale='Teal')
-                    st.plotly_chart(fig_kw, use_container_width=True)
-                
-                st.markdown("---")
-                # 뉴스 리스트
-                for item in news_items:
-                    with st.container():
-                        st.markdown(f"### [{item['title']}]({item['link']})")
-                        st.caption(f"{item['source']} | {item['published']}")
-                        st.markdown("---")
-            else:
-                st.info("뉴스를 불러올 수 없습니다.")
+            st.subheader(f"{info.get('longName', ticker_input)} ({ticker_input})")
+            
+            # 가격 정보
+            current_price = info.get('currentPrice', info.get('previousClose', 0))
+            target_price = info.get('targetMeanPrice', 0)
+            
+            # 핵심 지표 카드
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("현재 주가", f"${current_price:,.2f}" if current_price else "N/A")
+            m2.metric("시가총액", f"${info.get('marketCap', 0)/1e9:,.1f} B" if info.get('marketCap') else "N/A")
+            m3.metric("52주 최고가", f"${info.get('fiftyTwoWeekHigh', 0):,.2f}")
+            m4.metric("목표주가", f"${target_price:,.2f}" if target_price else "N/A", 
+                        delta=f"{(target_price/current_price - 1)*100:.1f}% Upside" if target_price and current_price else None)
 
-elif menu == "📊 타임폴리오 ETF 분석": # 메뉴명 변경
+            st.markdown("---")
+            
+            t1, t2 = st.tabs(["📊 밸류에이션 & 수익성", "📈 주가 차트"])
+            
+            with t1:
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.markdown("##### 💎 밸류에이션")
+                    df_val = pd.DataFrame([
+                        {"지표": "Trailing P/E", "값": info.get('trailingPE', 'N/A')},
+                        {"지표": "Forward P/E", "값": info.get('forwardPE', 'N/A')},
+                        {"지표": "PEG Ratio", "값": info.get('pegRatio', 'N/A')},
+                        {"지표": "PBR", "값": info.get('priceToBook', 'N/A')},
+                    ])
+                    st.dataframe(df_val, hide_index=True, use_container_width=True)
+                    
+                with c2:
+                    st.markdown("##### 💰 수익성 & 배당")
+                    df_prf = pd.DataFrame([
+                        {"지표": "ROE", "값": f"{info.get('returnOnEquity', 0)*100:.2f}%" if info.get('returnOnEquity') else 'N/A'},
+                        {"지표": "Profit Margin", "값": f"{info.get('profitMargins', 0)*100:.2f}%" if info.get('profitMargins') else 'N/A'},
+                        {"지표": "Dividend Yield", "값": f"{info.get('dividendRate', 0)*100:.2f}%" if info.get('dividendRate') else 'N/A'},
+                    ])
+                    st.dataframe(df_prf, hide_index=True, use_container_width=True)
+                
+                st.info(f"💡 {info.get('longBusinessSummary', '기업 설명 정보가 없습니다.')[:300]}...")
+
+            with t2:
+                hist = stock.history(period="1y")
+                if not hist.empty:
+                    st.line_chart(hist['Close'])
+                    
+        except Exception as e:
+            st.error(f"데이터 조회 실패: {e}")
+
+elif menu == "📊 타임폴리오 ETF 분석":
     st.title("📊 TIMEFOLIO ETF Comparison & Monitor")
     
     etf_categories = {
