@@ -110,6 +110,50 @@ def fetch_news_headline(query, lang='en'):
     except:
         return []
 
+@st.cache_data(ttl=1800)
+def fetch_country_briefing(country_code):
+    """국가별 핵심 재료 뉴스 헤드라인 Top 5 추출 (요약 형태)"""
+    
+    # 🔍 Catalyst Search Queries
+    if country_code == 'US':
+        query = "Earnings OR Awarded OR Launched OR Unveiled OR Acquisition OR FDA OR Regulation"
+        encoded = requests.utils.quote(query)
+        url = f"https://news.google.com/rss/search?q={encoded}+when:1d&hl=en-US&gl=US&ceid=US:en"
+        
+    elif country_code == 'KR':
+        query = "실적 OR 수주 OR 체결 OR 개발 OR 출시 OR 승인 OR 정책 OR 공시"
+        encoded = requests.utils.quote(query)
+        url = f"https://news.google.com/rss/search?q={encoded}+when:1d&hl=ko&gl=KR&ceid=KR:ko"
+        
+    elif country_code == 'CN':
+        query = "China Stimulus OR China Restriction OR China EV OR China Tech"
+        encoded = requests.utils.quote(query)
+        url = f"https://news.google.com/rss/search?q={encoded}+when:1d&hl=en-US&gl=US&ceid=US:en"
+    else:
+        return []
+
+    try:
+        feed = feedparser.parse(url)
+        briefings = []
+        seen_titles = set()
+        
+        for e in feed.entries:
+            # 제목 전처리: 언론사명 제거 및 길이 제한
+            title = re.sub(r'\s*-[^-]*$', '', e.title)
+            title = title.strip()
+            
+            # 중복 제거 (유사 제목 필터링)
+            if title not in seen_titles and len(title) > 10:
+                briefings.append({"title": title, "link": e.link})
+                seen_titles.add(title)
+                
+            if len(briefings) >= 5: # Top 5만 추출
+                break
+                
+        return briefings
+    except:
+        return []
+
 # 테마별 한국어 쿼리 매핑
 THEME_KR_QUERIES = {
     "🤖 AI & 반도체 혁명": "엔비디아 반도체 AI 주가",
@@ -150,6 +194,40 @@ if menu == "📰 데일리 마켓 내러티브":
     단순한 지수 나열이 아닙니다.  
     **"어제 무슨 이슈(Topic)가 있었고 ➡️ 그 결과 어떤 자산이 움직였는지(Impact)"** 인과관계를 중심으로 정리합니다.
     """)
+    st.markdown("---")
+    
+    # [0] 글로벌 마켓 브리핑 (New Feature: Catalyst Summary)
+    with st.expander("🌍 Global Market Catalyst Briefing (US/KR/CN)", expanded=True):
+        st.markdown("각 국가별 시장을 움직이는 **핵심 재료(실적, 정책, 신기술)** 뉴스 요약입니다.")
+        c1, c2, c3 = st.columns(3)
+        
+        with c1:
+            st.markdown("#### 🇺🇸 United States")
+            brief_us = fetch_country_briefing('US')
+            if brief_us:
+                for item in brief_us:
+                    st.markdown(f"- [{item['title']}]({item['link']})")
+            else:
+                st.caption("데이터 수집 불가")
+                
+        with c2:
+            st.markdown("#### 🇰🇷 Korea")
+            brief_kr = fetch_country_briefing('KR')
+            if brief_kr:
+                for item in brief_kr:
+                    st.markdown(f"- [{item['title']}]({item['link']})")
+            else:
+                st.caption("데이터 수집 불가")
+                
+        with c3:
+            st.markdown("#### 🇨🇳 China (Market)")
+            brief_cn = fetch_country_briefing('CN')
+            if brief_cn:
+                for item in brief_cn:
+                    st.markdown(f"- [{item['title']}]({item['link']})")
+            else:
+                st.caption("데이터 수집 불가")
+
     st.markdown("---")
     
     # [1] 오늘의 Top 3 이슈 카드 (상단 강조)
